@@ -3,20 +3,40 @@
  * hwmon driver for Gigabyte AORUS Waterforce AIO CPU coolers: X240, X280 and X360.
  *
  * Copyright 2023 Aleksa Savic <savicaleksa83@gmail.com>
+ * Copyright 2026 Vasily Sokolov <extracker0mail@gmail.com>
  */
 
+#include <linux/cpufreq.h>
 #include <linux/debugfs.h>
+#include <linux/fs.h>
 #include <linux/hid.h>
 #include <linux/hwmon.h>
 #include <linux/jiffies.h>
+#include <linux/kernel_stat.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
+#include <linux/workqueue.h>
+
+/* LCD command bytes */
+#define LCD_CMD_BYTE0	0x99
+#define LCD_CMD_BYTE1	0xE0
+
+/* Maximum number of hwmon devices and attributes to scan for LCD sensors */
+#define LCD_HWMON_MAX_DEVS	128
+#define LCD_TEMP_ATTR_MAX	32
+#define LCD_POWER_ATTR_MAX	16
+
+/* Minimum LCD refresh interval in ms */
+#define LCD_REFRESH_MS_MIN	100
 
 #define DRIVER_NAME	"gigabyte_waterforce"
 
-#define USB_VENDOR_ID_GIGABYTE		0x1044
-#define USB_PRODUCT_ID_WATERFORCE	0x7a4d	/* Gigabyte AORUS WATERFORCE X240, X280 and X360 */
+#define USB_VENDOR_ID_CHU_YUEN		0x1044
+#define USB_PRODUCT_ID_WATERFORCE_X	0x7a4d	/* Gigabyte AORUS WATERFORCE X 240, X 280, X 360 */
+
+#define USB_VENDOR_ID_GIGABYTE		    0x0414
+#define USB_PRODUCT_ID_WATERFORCE_X_II	0x7a5e	/* Gigabyte AORUS WATERFORCE X II 240, X II 280, X II 360 */
 
 #define STATUS_VALIDITY		(2 * 1000)	/* ms */
 #define MAX_REPORT_LENGTH	6144
@@ -24,8 +44,21 @@
 #define WATERFORCE_TEMP_SENSOR	0xD
 #define WATERFORCE_FAN_SPEED	0x02
 #define WATERFORCE_PUMP_SPEED	0x05
-#define WATERFORCE_FAN_DUTY	0x08
+#define WATERFORCE_FAN_DUTY	    0x08
 #define WATERFORCE_PUMP_DUTY	0x09
+
+/* Module parameters for LCD sensor discovery */
+static char *lcd_temp_label = "Tctl";
+module_param(lcd_temp_label, charp, 0444);
+MODULE_PARM_DESC(lcd_temp_label, "hwmon sensor label for LCD CPU temperature (default: Tctl)");
+
+static char *lcd_power_label = "RAPL_P_Package";
+module_param(lcd_power_label, charp, 0444);
+MODULE_PARM_DESC(lcd_power_label, "hwmon sensor label for LCD CPU power in watts (default: RAPL_P_Package)");
+
+static unsigned int lcd_refresh_ms = 2000;
+module_param(lcd_refresh_ms, uint, 0444);
+MODULE_PARM_DESC(lcd_refresh_ms, "LCD update interval in milliseconds (default: 2000)");
 
 /* Control commands, inner offsets and lengths */
 static const u8 get_status_cmd[] = { 0x99, 0xDA };
@@ -68,6 +101,13 @@ struct waterforce_data {
 	u8 *buffer;
 	int firmware_version;
 	unsigned long updated;	/* jiffies */
+
+	/* LCD update worker */
+	struct delayed_work lcd_work;
+	char lcd_temp_path[256];	/* sysfs path to temp sensor (empty = not yet found) */
+	char lcd_power_path[256];	/* sysfs path to power sensor (empty = not yet found) */
+	u64 lcd_prev_idle;		/* previous aggregate idle ticks for CPU usage delta */
+	u64 lcd_prev_total;		/* previous aggregate total ticks for CPU usage delta */
 };
 
 static umode_t waterforce_is_visible(const void *data,
@@ -286,6 +326,189 @@ static int waterforce_raw_event(struct hid_device *hdev, struct hid_report *repo
 	return 0;
 }
 
+/*
+ * Read an integer value from a sysfs pseudo-file.
+ * Used to read hwmon sensor values (temp*_input, power*_input) from other
+ * kernel drivers without requiring a userspace intermediary.
+ */
+static int waterforce_sysfs_read_long(const char *path, long *val)
+{
+	struct file *f;
+	char buf[32];
+	ssize_t len;
+	loff_t pos = 0;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+
+	len = kernel_read(f, buf, sizeof(buf) - 1, &pos);
+	filp_close(f, NULL);
+
+	if (len <= 0)
+		return len < 0 ? len : -EIO;
+
+	buf[len] = '\0';
+	return kstrtol(strim(buf), 10, val);
+}
+
+/*
+ * Scan hwmon devices to find a sensor whose *_label attribute matches
+ * sensor_label. attr_type is "temp" or "power", max_n is the highest
+ * attribute index to try. On success stores the path to the corresponding
+ * *_input file in result and returns 0.
+ */
+static int waterforce_find_hwmon_sensor(const char *sensor_label,
+					const char *attr_type, int max_n,
+					char *result, size_t result_len)
+{
+	char path[256], label_buf[64];
+	struct file *f;
+	ssize_t len;
+	loff_t pos;
+	int hwmon_n, idx;
+
+	for (hwmon_n = 0; hwmon_n < LCD_HWMON_MAX_DEVS; hwmon_n++) {
+		for (idx = 1; idx <= max_n; idx++) {
+			snprintf(path, sizeof(path),
+				 "/sys/class/hwmon/hwmon%d/%s%d_label",
+				 hwmon_n, attr_type, idx);
+
+			f = filp_open(path, O_RDONLY, 0);
+			if (IS_ERR(f))
+				continue;
+
+			pos = 0;
+			len = kernel_read(f, label_buf, sizeof(label_buf) - 1, &pos);
+			filp_close(f, NULL);
+
+			if (len <= 0)
+				continue;
+
+			label_buf[len] = '\0';
+			strim(label_buf);
+
+			if (strcmp(label_buf, sensor_label) == 0) {
+				snprintf(result, result_len,
+					 "/sys/class/hwmon/hwmon%d/%s%d_input",
+					 hwmon_n, attr_type, idx);
+				return 0;
+			}
+		}
+	}
+	return -ENODEV;
+}
+
+/*
+ * Compute overall CPU usage as a percentage by comparing aggregate idle and
+ * total tick counts between consecutive work invocations. Matches the
+ * calculation used by /proc/stat: idle = CPUTIME_IDLE, total = all fields.
+ */
+static int waterforce_get_cpu_usage(struct waterforce_data *priv)
+{
+	u64 idle = 0, total = 0, delta_idle, delta_total;
+	int cpu, i;
+
+	for_each_possible_cpu(cpu) {
+		struct kernel_cpustat ks = kcpustat_cpu(cpu);
+
+		idle += ks.cpustat[CPUTIME_IDLE];
+		for (i = 0; i < NR_STATS; i++)
+			total += ks.cpustat[i];
+	}
+
+	delta_idle  = idle  - priv->lcd_prev_idle;
+	delta_total = total - priv->lcd_prev_total;
+
+	priv->lcd_prev_idle  = idle;
+	priv->lcd_prev_total = total;
+
+	if (delta_total == 0)
+		return 0;
+
+	return clamp_t(int, 100 * (delta_total - delta_idle) / delta_total, 0, 100);
+}
+
+static void waterforce_lcd_work_func(struct work_struct *work)
+{
+	struct waterforce_data *priv =
+		container_of(work, struct waterforce_data, lcd_work.work);
+	long temp_mc, power_uw;
+	int temp_c = 0, power_w = 0, cpu_usage, freq_mhz;
+	u8 *buf;
+
+	/*
+	 * Lazily discover sensor paths. Paths are cached so the scan only
+	 * runs once (or again if a sensor disappears and reappears).
+	 */
+	if (!priv->lcd_temp_path[0])
+		waterforce_find_hwmon_sensor(lcd_temp_label, "temp",
+					     LCD_TEMP_ATTR_MAX,
+					     priv->lcd_temp_path,
+					     sizeof(priv->lcd_temp_path));
+
+	if (!priv->lcd_power_path[0])
+		waterforce_find_hwmon_sensor(lcd_power_label, "power",
+					     LCD_POWER_ATTR_MAX,
+					     priv->lcd_power_path,
+					     sizeof(priv->lcd_power_path));
+
+	/* Read temperature (hwmon reports in millidegrees Celsius) */
+	if (priv->lcd_temp_path[0]) {
+		if (waterforce_sysfs_read_long(priv->lcd_temp_path, &temp_mc) == 0)
+			temp_c = clamp_t(int, temp_mc / 1000, 0, 255);
+		else
+			priv->lcd_temp_path[0] = '\0'; /* sensor gone, retry next time */
+	}
+
+	/* Read power (hwmon reports in microwatts) */
+	if (priv->lcd_power_path[0]) {
+		if (waterforce_sysfs_read_long(priv->lcd_power_path, &power_uw) == 0)
+			power_w = clamp_t(int, power_uw / 1000000, 0, 255);
+		else
+			priv->lcd_power_path[0] = '\0'; /* sensor gone, retry next time */
+	}
+
+	/* CPU usage: delta of kernel tick counters since last invocation */
+	cpu_usage = waterforce_get_cpu_usage(priv);
+
+	/* CPU frequency from cpufreq subsystem (returns kHz, we need MHz) */
+	freq_mhz = cpufreq_quick_get(0) / 1000;
+
+	/*
+	 * Build and send the LCD update payload. Protocol reverse-engineered
+	 * from the AorusWaterForce360-linux Go daemon.
+	 * buf[0..1] = command { 0x99, 0xE0 }
+	 * buf[3]    = CPU temperature in degrees C
+	 * buf[4]    = 0x10 (temperature field marker)
+	 * buf[5]    = CPU frequency, integer GHz
+	 * buf[6]    = CPU frequency, first decimal digit (100 MHz resolution)
+	 * buf[7]    = 0x08 (frequency field marker)
+	 * buf[8]    = 0x18 (frequency field marker)
+	 * buf[10]   = CPU usage in percent
+	 * buf[11]   = CPU package power in watts
+	 */
+	mutex_lock(&priv->buffer_lock);
+	buf = priv->buffer;
+	memset(buf, 0, MAX_REPORT_LENGTH);
+	buf[0]  = LCD_CMD_BYTE0;
+	buf[1]  = LCD_CMD_BYTE1;
+	buf[3]  = (u8)temp_c;
+	buf[4]  = 0x10;
+	buf[5]  = (u8)(freq_mhz / 1000);
+	buf[6]  = (u8)((freq_mhz / 100) % 10);
+	buf[7]  = 0x08;
+	buf[8]  = 0x18;
+	buf[10] = (u8)cpu_usage;
+	buf[11] = (u8)power_w;
+	hid_hw_output_report(priv->hdev, buf, MAX_REPORT_LENGTH);
+	mutex_unlock(&priv->buffer_lock);
+
+	schedule_delayed_work(&priv->lcd_work,
+			      msecs_to_jiffies(max(lcd_refresh_ms,
+						   (unsigned int)LCD_REFRESH_MS_MIN)));
+}
+
 static int firmware_version_show(struct seq_file *seqf, void *unused)
 {
 	struct waterforce_data *priv = seqf->private;
@@ -311,6 +534,7 @@ static void waterforce_debugfs_init(struct waterforce_data *priv)
 
 static int waterforce_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
+	const char *model_name = (const char *)id->driver_data;
 	struct waterforce_data *priv;
 	int ret;
 
@@ -360,6 +584,7 @@ static int waterforce_probe(struct hid_device *hdev, const struct hid_device_id 
 	spin_lock_init(&priv->status_report_request_lock);
 	init_completion(&priv->status_report_received);
 	init_completion(&priv->fw_version_processed);
+	INIT_DELAYED_WORK(&priv->lcd_work, waterforce_lcd_work_func);
 
 	hid_device_io_start(hdev);
 	ret = waterforce_get_fw_ver(hdev);
@@ -376,6 +601,16 @@ static int waterforce_probe(struct hid_device *hdev, const struct hid_device_id 
 
 	waterforce_debugfs_init(priv);
 
+	schedule_delayed_work(&priv->lcd_work,
+			      msecs_to_jiffies(max(lcd_refresh_ms,
+						   (unsigned int)LCD_REFRESH_MS_MIN)));
+
+	hid_info(hdev, "Device:          %s", model_name);
+	hid_info(hdev, "  Firmware:      v%d", priv->firmware_version);
+	hid_info(hdev, "  Temp sensor:   %s", lcd_temp_label);
+	hid_info(hdev, "  Power sensor:  %s", lcd_power_label);
+	hid_info(hdev, "  Refresh:       %u ms", lcd_refresh_ms);
+
 	return 0;
 
 fail_and_close:
@@ -389,6 +624,7 @@ static void waterforce_remove(struct hid_device *hdev)
 {
 	struct waterforce_data *priv = hid_get_drvdata(hdev);
 
+	cancel_delayed_work_sync(&priv->lcd_work);
 	debugfs_remove_recursive(priv->debugfs);
 	hwmon_device_unregister(priv->hwmon_dev);
 
@@ -397,7 +633,14 @@ static void waterforce_remove(struct hid_device *hdev)
 }
 
 static const struct hid_device_id waterforce_table[] = {
-	{ HID_USB_DEVICE(USB_VENDOR_ID_GIGABYTE, USB_PRODUCT_ID_WATERFORCE) },
+	{
+		HID_USB_DEVICE(USB_VENDOR_ID_CHU_YUEN, USB_PRODUCT_ID_WATERFORCE_X),
+		.driver_data = (unsigned long)"Gigabyte AORUS WATERFORCE X 240/280/360"
+	},
+	{
+		HID_USB_DEVICE(USB_VENDOR_ID_GIGABYTE, USB_PRODUCT_ID_WATERFORCE_X_II),
+		.driver_data = (unsigned long)"Gigabyte AORUS WATERFORCE X II 240/280/360"
+	},
 	{ }
 };
 
@@ -426,5 +669,5 @@ late_initcall(waterforce_init);
 module_exit(waterforce_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Aleksa Savic <savicaleksa83@gmail.com>");
+MODULE_AUTHOR("Aleksa Savic <savicaleksa83@gmail.com>, Vasily Sokolov <extracker0mail@gmail.com>");
 MODULE_DESCRIPTION("Hwmon driver for Gigabyte AORUS Waterforce AIO coolers");
